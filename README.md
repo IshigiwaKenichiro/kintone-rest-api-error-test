@@ -11,6 +11,9 @@ npm run build
 node dist/index.mjs
 ```
 
+> **このエラーは 5.7.5 のものです。** 6.2.1 では解消していますが、別の理由で
+> `--format=esm` のままでは実行できません。回避策とあわせて **続報** にまとめました。
+
 ## 概要
 
 このプロジェクトは、`@kintone/rest-api-client` パッケージを esbuild でバンドルした際に発生する `Cannot find module '.'` エラーを再現するための最小限の環境です。
@@ -203,6 +206,90 @@ esbuild は、解決できないモジュールがあっても：
 - ブラウザ環境（`package.json` の `browser` フィールドが使われる）
 - CommonJS 環境（`lib/src/index.js` が直接使われる）
 - バンドルしない環境（`node_modules` から直接読み込む）
+
+## 続報: 6.2.1 での状況（2026-09-01 検証）
+
+**当初の `Cannot find module .` は 6.2.1 で解消しています。** ただし `--format=esm` だけでは
+依然として実行できず、**エラーが別のものに変わります。**
+
+6.2.1 の `index.mjs` は、`require(".")` が失敗したら ESM 版に切り替える形になりました。
+
+```javascript
+let mod;
+try {
+  const { createRequire } = await import("node:module");
+  const require = createRequire(import.meta.url);
+  mod = require(".");
+} catch {
+  // Non-Node runtimes (e.g. Cloudflare Workers): fall back to the ESM entry
+  mod = await import("./esm/src/index.js");
+}
+```
+
+esbuild はこの `import("./esm/src/index.js")` を静的に辿るため、**バンドルに本体が取り込まれます**
+（452b → 約 694KB）。
+
+`require(".")` 自体はバンドル後も残りますが、`try` の中にあるため失敗しても例外になりません。
+
+```javascript
+// バンドル後の dist/index.mjs
+var mod;
+try {
+  const { createRequire } = await import("node:module");
+  const require2 = createRequire(import.meta.url);
+  mod = require2(".");                     // ← 失敗するが
+} catch {
+  mod = await Promise.resolve().then(() => (init_src(), src_exports));  // ← こちらに落ちる
+}
+```
+
+`catch` 側の `src_exports` はバンドルに取り込まれた ESM 版です。**5.7.5 で表面化していた**
+**`Cannot find module '.'` は、この `catch` に吸収されて出なくなります。**
+
+ただし、そうして読み込まれた ESM 版が依存する `form-data` / `combined-stream` は CommonJS で
+`require("util")` しており、今度はそこが esbuild の挿入する shim に引っかかります。
+
+```
+Error: Dynamic require of "util" is not supported
+    at node_modules/combined-stream/lib/combined_stream.js
+    at node_modules/form-data/lib/form_data.js
+    at node_modules/@kintone/rest-api-client/esm/src/client/FileClient.js
+```
+
+### 条件別の検証結果
+
+Node.js v24.14.0 / esbuild 0.25.10 で、同じ `index.ts` をビルドして実行した結果です。
+
+| 版 | ビルド条件 | ビルド | 実行 | 結果 |
+|---|---|---|---|---|
+| 5.7.5 | `--format=esm` | ✅ | ❌ | `Cannot find module .` |
+| 5.7.5 | `--format=esm` + createRequire の banner | ✅ | ❌ | `Cannot find module .`（変わらず） |
+| 5.7.5 | `--format=cjs` | ✅ | ❌ | `createRequire` に `import.meta.url` が渡らず `ERR_INVALID_ARG_VALUE` |
+| 5.7.5 | `--format=esm --packages=external` | ✅ | ✅ | **動く** |
+| 6.2.1 | `--format=esm` | ✅ | ❌ | `Dynamic require of "util" is not supported` |
+| 6.2.1 | `--format=esm` + createRequire の banner | ✅ | ✅ | **動く** |
+| 6.2.1 | `--format=cjs` | ❌ | — | `Top-level await is currently not supported with the "cjs" output format` |
+| 6.2.1 | `--format=esm --packages=external` | ✅ | ✅ | **動く** |
+
+### 回避策
+
+**`--packages=external` を付ける**のが確実です。5.7.5 でも 6.2.1 でも動きます。
+バンドルに含めない代わりに `node_modules` を配置する必要があるため、Lambda ならレイヤーか
+デプロイパッケージへの同梱が要ります。
+
+```bash
+esbuild index.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/index.mjs
+```
+
+**バンドルに含めたい場合は 6.2.1 以降に上げたうえで、banner で `createRequire` を注入します。**
+
+```bash
+esbuild index.ts --bundle --platform=node --format=esm   --banner:js="import{createRequire}from'module';const require=createRequire(import.meta.url);"   --outfile=dist/index.mjs
+```
+
+**この banner は 5.7.5 では効きません。** 5.7.5 の `require(".")` は
+「バンドル後の位置から見た `.`」を解決しようとするため、`require` が定義されていても
+参照先が見つからないからです。バンドルしたいなら 6.2.1 以降に上げてください。
 
 ## ライセンス
 
